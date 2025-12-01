@@ -495,20 +495,46 @@ def preprocess_question(question, max_retries=2):
     is_incomplete = not any(q_word in question_lower for q_word in ["is", "does", "what", "can", "will", "are", "do", "how", "when", "where", "why"])
     has_creditor_mention = any(creditor in question_lower for creditor in [
         "oportun", "regional", "mortgage", "auto", "student", "credit union",
-        "discover", "amex", "clarity", "elevate"
+        "discover", "amex", "clarity", "elevate", "navy federal", "consumer shield",
+        "credit", "creditor", "debt", "loan"
     ])
+    
+    # Check if question is already well-formed (has question word + creditor + program context)
+    is_well_formed = (
+        any(q_word in question_lower for q_word in ["is", "does", "what", "can", "will", "are", "do", "how", "when", "where", "why"]) and
+        len(question.split()) >= 5 and  # At least 5 words
+        ("elevate" in question_lower or "clarity" in question_lower or "consumer shield" in question_lower or "program" in question_lower)
+    )
+    
+    # If question is already well-formed, skip GPT clarification
+    if is_well_formed:
+        logger.info(f"Question is well-formed, skipping clarification: {question}")
+        # Just ensure "Consumer Shield" is understood as Elevate/Clarity if present
+        if "consumer shield" in question_lower and "elevate" not in question_lower and "clarity" not in question_lower:
+            # Replace "consumer shield" with "Elevate or Clarity programs" for better search
+            question = question.replace("Consumer Shield", "Elevate or Clarity programs").replace("consumer shield", "Elevate or Clarity programs")
+        return question
     
     # If question needs clarification, use GPT to reformat it
     if (is_very_short or is_incomplete) and has_creditor_mention:
         try:
             clarification_prompt = f"""The user asked: "{question}"
 
-This question is about debt relief programs (Elevate and Clarity). Please reformat it into a clear, complete question that asks about eligibility or acceptance.
+This question is about debt relief programs (Elevate and Clarity, also called "Consumer Shield"). Please reformat it into a clear, complete question that asks about eligibility or acceptance.
+
+CRITICAL: Preserve the original meaning. If asking about a creditor's debt being enrolled in the program, keep that structure.
 
 Examples:
 - "Oportun is eligble?" -> "Is Oportun eligible for Elevate or Clarity programs?"
 - "mortgage accepted?" -> "Are mortgage loans accepted in Elevate or Clarity programs?"
 - "regional finance" -> "Is Regional Finance accepted in Elevate or Clarity programs?"
+- "Navy Federal Credit se puede ingresar esta deuda en consumer shield?" -> "Can Navy Federal Credit Union debt be enrolled in Elevate or Clarity programs?"
+- "Can Navy Federal Credit include this debt in Consumer Shield?" -> "Can Navy Federal Credit Union debt be enrolled in Elevate or Clarity programs?"
+
+IMPORTANT: 
+- "Consumer Shield" refers to the programs (Elevate/Clarity), NOT something a creditor owns
+- If question asks about enrolling a creditor's debt, keep that structure
+- Don't change "can X debt be enrolled" to "can debt be enrolled in X's program"
 
 Just return the reformatted question, nothing else:"""
             
@@ -531,9 +557,24 @@ Just return the reformatted question, nothing else:"""
             
             # Remove quotes if GPT added them
             clarified = clarified.strip('"').strip("'")
-            if clarified and len(clarified) > len(question) * 0.5:  # Only use if it's reasonable
+            
+            # Validate that clarification preserves key terms from original
+            original_key_terms = set(question_lower.split())
+            clarified_lower = clarified.lower()
+            key_terms_preserved = any(term in clarified_lower for term in original_key_terms if len(term) > 3)
+            
+            # Only use if it's reasonable length and preserves key terms
+            if clarified and len(clarified) > len(question) * 0.5 and key_terms_preserved:
+                # Double-check: if original had "consumer shield" or program name, make sure clarified keeps it
+                if "consumer shield" in question_lower and "consumer shield" not in clarified_lower:
+                    # Add program context if missing
+                    if "elevate" not in clarified_lower and "clarity" not in clarified_lower:
+                        clarified = clarified.rstrip("?") + " in Elevate or Clarity programs?"
+                
                 logger.info(f"Question clarified: '{question}' -> '{clarified}'")
                 return clarified
+            else:
+                logger.warning(f"Clarification rejected - doesn't preserve key terms or too short")
         except Exception as e:
             logger.warning(f"Question clarification failed: {e}, using original question")
     
