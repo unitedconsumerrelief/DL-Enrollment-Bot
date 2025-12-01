@@ -1301,11 +1301,29 @@ def respond(channel, thread_ts, user_mention, question):
 
 @app.event("app_mention")
 def handle_app_mention_events(body, event, say):
+    """Handle when bot is mentioned with @docgpt - mentions only, no DMs"""
     text = event.get("text", "")
     channel = event["channel"]
     thread_ts = event.get("ts")
     user_mention = f"<@{event.get('user')}>"
-    respond(channel, thread_ts, user_mention, text)
+    
+    # Remove bot mention from text (e.g., "<@U123456> your question" -> "your question")
+    # Remove any @ mentions from the text
+    import re
+    text = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
+    
+    if text:  # Only respond if there's actual text after removing mentions
+        respond(channel, thread_ts, user_mention, text)
+    else:
+        # If just mentioned without a question, send a helpful message
+        try:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"Hi {user_mention}! 👋 Ask me a question about Elevate or Clarity programs.\n\nExample: `@docgpt Does Elevate accept mortgage loans?`"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send help message: {e}")
 
 if __name__ == "__main__":
     logger.info("🚀 Starting Slack DocGPT bot with codex and document fallback...")
