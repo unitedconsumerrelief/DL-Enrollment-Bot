@@ -719,9 +719,10 @@ def check_consumer_shield_eligibility(question, creditor_name=None):
         if any(store in creditor_lower for store in furniture_stores):
             return (False, "Furniture stores that provide their own financing are NOT accepted", "furniture store")
         
-        # Credit unions
-        if "credit union" in creditor_lower or "cu" in creditor_lower or creditor_lower.endswith("cu"):
-            return (False, "Credit Union loans are NOT accepted (All or Nothing rule applies)", "credit union")
+        # Credit unions - check for various patterns
+        credit_union_indicators = ["credit union", "cu", "federal credit", "navy federal", "fcu", "nfc"]
+        if any(indicator in creditor_lower for indicator in credit_union_indicators) or creditor_lower.endswith("cu"):
+            return (False, "Credit Union loans are NOT accepted in Consumer Shield (All or Nothing rule applies)", "credit union")
         
         # USAA special case
         if "usaa" in creditor_lower:
@@ -1222,18 +1223,53 @@ def handle_question(question):
     # Step 2.5: Check Consumer Shield eligibility based on account type
     consumer_shield_info = None
     question_lower_for_cs = question_clean
-    # Extract creditor name if mentioned
+    
+    # Extract creditor name if mentioned - improved extraction
     creditor_mentioned = None
-    # Try to find creditor name in question (look for capitalized words that might be creditor names)
+    # Look for common creditor patterns in the original question (before lowercasing)
     words = question.split()
-    for i, word in enumerate(words):
-        if len(word) > 3 and word[0].isupper() and word.lower() not in ["Can", "Does", "Is", "Are", "Will", "Would", "Should", "Accept", "Accepted", "Eligible", "Enroll", "Enrollment", "Navy", "Federal", "Credit", "Union"]:
-            # Check if next word is also capitalized (like "Navy Federal")
-            if i + 1 < len(words) and words[i+1][0].isupper():
-                creditor_mentioned = f"{word} {words[i+1]}"
-            else:
-                creditor_mentioned = word
-            break
+    creditor_patterns = []
+    for i in range(len(words)):
+        # Check for multi-word creditor names (e.g., "Navy Federal Credit Union")
+        if i + 2 < len(words) and words[i][0].isupper() and words[i+1][0].isupper() and words[i+2][0].isupper():
+            potential_creditor = f"{words[i]} {words[i+1]} {words[i+2]}"
+            if any(term in potential_creditor.lower() for term in ["credit union", "federal", "bank", "finance", "financial"]):
+                creditor_mentioned = potential_creditor
+                break
+        # Check for two-word creditor names (e.g., "Navy Federal")
+        elif i + 1 < len(words) and words[i][0].isupper() and words[i+1][0].isupper():
+            potential_creditor = f"{words[i]} {words[i+1]}"
+            if any(term in potential_creditor.lower() for term in ["credit union", "federal", "bank", "finance", "financial", "navy"]):
+                creditor_mentioned = potential_creditor
+                break
+    
+    # Also check question_lower for credit union mentions - improved detection
+    credit_union_patterns = ["credit union", "cu", "federal credit", "navy federal", "nfc"]
+    if any(pattern in question_lower_for_cs for pattern in credit_union_patterns):
+        if not creditor_mentioned:
+            # Extract the full credit union name from original question
+            cu_match = re.search(r'(\w+\s+)?(credit\s+union|cu|federal\s+credit)', question, re.IGNORECASE)
+            if cu_match:
+                # Get words before the match
+                match_start = question.lower().find(cu_match.group(0).lower())
+                start_idx = max(0, match_start - 30)
+                context = question[start_idx:match_start + len(cu_match.group(0)) + 10]
+                # Extract capitalized words that might be the credit union name
+                words_in_context = context.split()
+                cu_name_parts = []
+                for i, word in enumerate(words_in_context):
+                    if word[0].isupper() and word.lower() not in ["Can", "Does", "Is", "Are", "Will", "Would", "Should", "Accept", "Accepted", "Eligible", "Enroll", "Enrollment"]:
+                        cu_name_parts.append(word)
+                        # Check if next word is also capitalized (like "Navy Federal")
+                        if i + 1 < len(words_in_context) and words_in_context[i+1][0].isupper():
+                            cu_name_parts.append(words_in_context[i+1])
+                            if i + 2 < len(words_in_context) and words_in_context[i+2][0].isupper():
+                                cu_name_parts.append(words_in_context[i+2])
+                        break
+                if cu_name_parts:
+                    creditor_mentioned = " ".join(cu_name_parts)
+                else:
+                    creditor_mentioned = "Credit Union"  # Fallback
     
     cs_eligible, cs_reason, cs_account_type = check_consumer_shield_eligibility(question_lower_for_cs, creditor_mentioned)
     if cs_eligible is not None:
@@ -1242,7 +1278,16 @@ def handle_question(question):
             "reason": cs_reason,
             "account_type": cs_account_type
         }
-        logger.info(f"Consumer Shield check: {cs_eligible} - {cs_reason}")
+        logger.info(f"Consumer Shield check: {cs_eligible} - {cs_reason} (Creditor: {creditor_mentioned})")
+    else:
+        # Even if we can't determine eligibility, we should still check for credit unions
+        if "credit union" in question_lower_for_cs or (creditor_mentioned and ("credit union" in creditor_mentioned.lower() or creditor_mentioned.lower().endswith("cu"))):
+            consumer_shield_info = {
+                "eligible": False,
+                "reason": "Credit Union loans are NOT accepted in Consumer Shield (All or Nothing rule applies)",
+                "account_type": "credit union loan"
+            }
+            logger.info(f"Consumer Shield check: Credit Union detected - NOT accepted")
     
     # Step 3: Global disqualification check (additional creditors not in hardcoded rules)
     global_disqualified = [
@@ -1363,7 +1408,11 @@ def handle_question(question):
         "2. Read ALL provided document chunks carefully - information may be in any of them.\n"
         "3. Look for EXACT matches to the question terms, synonyms, and related concepts.\n"
         "4. If information exists in the chunks, you MUST provide it - do not say 'not found' if it's actually there.\n"
-        "5. Always answer for *all three* programs (Elevate, Clarity, and Consumer Shield), even if the question mentions only one.\n"
+        "5. **MANDATORY**: Always answer for *all three* programs (Elevate, Clarity, and Consumer Shield), even if the question mentions only one.\n"
+        "   - You MUST provide an answer for Consumer Shield in EVERY response\n"
+        "   - Do NOT say 'not applicable' or 'question does not ask about this program'\n"
+        "   - Use the Consumer Shield eligibility check information if provided\n"
+        "   - If Consumer Shield eligibility info is provided, use it directly in your answer\n"
         "6. Use ✅ for accepted/eligible, ❌ for not accepted/ineligible, ⚠️ for conditional/uncertain.\n"
         "7. Quote specific details from the chunks when possible (e.g., percentages, dollar amounts, conditions).\n\n"
         
@@ -1396,9 +1445,17 @@ def handle_question(question):
         "REMEMBER: Respond ONLY in English. Do not use Spanish in your response."
     )
     
-    # Add Consumer Shield info to context if available
+    # Add Consumer Shield info to context if available - make it very prominent
     if consumer_shield_info:
-        context += f"\n\n[Consumer Shield Eligibility Check]:\nAccount Type: {consumer_shield_info['account_type']}\nEligible: {consumer_shield_info['eligible']}\nReason: {consumer_shield_info['reason']}"
+        context = f"[IMPORTANT - Consumer Shield Eligibility]:\n" + \
+                 f"Account Type: {consumer_shield_info['account_type']}\n" + \
+                 f"Eligible: {'YES ✅' if consumer_shield_info['eligible'] else 'NO ❌'}\n" + \
+                 f"Reason: {consumer_shield_info['reason']}\n\n" + \
+                 f"{context}\n\n" + \
+                 f"[REMINDER - Consumer Shield Answer Required]:\n" + \
+                 f"You MUST provide a Consumer Shield answer based on the eligibility check above. " + \
+                 f"Do NOT say 'not applicable' or 'question does not ask about this program'. " + \
+                 f"Always answer for Consumer Shield using the eligibility information provided."
     # Ensure question is in English for processing (translate if needed)
     question_lang = detect_language(question)
     if question_lang == "spanish":
