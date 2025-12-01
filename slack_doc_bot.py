@@ -608,6 +608,7 @@ def is_valid_primary_chunk(chunk, source, question_keywords=None):
     # Primary program documents
     is_clarity = "clarity" in source_lower or "affiliate_training_packet" in source_lower
     is_elevate = "elevate" in source_lower
+    is_consumer_shield = "consumer shield" in source_lower
     
     # Policy and reference documents - expanded list
     is_policy = any(term in source_lower for term in [
@@ -634,11 +635,11 @@ def is_valid_primary_chunk(chunk, source, question_keywords=None):
         return True
     
     # More lenient: include if from any policy document OR has minimum word count
-    return (is_clarity or is_elevate or is_policy) and word_count >= 3
+    return (is_clarity or is_elevate or is_consumer_shield or is_policy) and word_count >= 3
 
 def get_program_sources_from_chunks(chunk_sources):
     """
-    Extract program names from chunk sources, only counting Clarity and Elevate.
+    Extract program names from chunk sources, including Clarity, Elevate, and Consumer Shield.
     """
     programs = set()
     for source in chunk_sources:
@@ -647,7 +648,86 @@ def get_program_sources_from_chunks(chunk_sources):
             programs.add("Clarity")
         if "elevate" in source_lower:
             programs.add("Elevate")
+        if "consumer shield" in source_lower:
+            programs.add("Consumer Shield")
     return sorted(list(programs))
+
+def check_consumer_shield_eligibility(question, creditor_name=None):
+    """
+    Check if a creditor/account type is eligible for Consumer Shield based on account type rules.
+    Returns (is_eligible, reason, account_type)
+    """
+    question_lower = question.lower()
+    
+    # Consumer Shield CAN enroll account types
+    can_enroll_types = [
+        "unsecured credit card", "credit card", "unsecured credit",
+        "business credit", "business loan", "business debt",
+        "unsecured line of credit", "line of credit",
+        "apartment back rent", "back rent", "rent",
+        "medical bill", "medical debt", "medical",
+        "cell phone bill", "cell phone", "phone bill",
+        "usaa",
+        "deficiency", "deficiencies",
+        "auto loan after repo", "auto loan after repossession", "repo deficiency",
+        "unsecured personal loan", "personal loan",
+        "utility bill", "utility",
+        "tribal loan", "tribal",
+        "payday loan", "pay day loan",
+        "peer to peer loan", "peer to peer"
+    ]
+    
+    # Consumer Shield CANNOT enroll account types
+    cannot_enroll_types = [
+        "timeshare", "timeshares",
+        "mortgage", "mortgages",
+        "federal student loan", "federal student",
+        "judgement", "judgment",
+        "irs tax debt", "irs", "tax debt",
+        "cross collateralized", "cross collateral",
+        "furniture store", "furniture financing",
+        "loan from individual", "loan from person",
+        "installment sales contract",
+        "credit union loan", "credit union",
+        "direct loan from furniture store",
+        "military account", "military",
+        "afes account", "afes"
+    ]
+    
+    # Check if question mentions any CAN enroll types
+    for enroll_type in can_enroll_types:
+        if enroll_type in question_lower:
+            # Special cases
+            if "credit union" in question_lower and "unsecured line of credit" in question_lower:
+                return (False, "Credit Union lines of credit are NOT accepted (except unsecured lines)", "credit union line of credit")
+            if "usaa" in question_lower:
+                return (True, "USAA is accepted as long as no other secured debt exists", "usaa")
+            if "credit union" in question_lower and "loan" in question_lower:
+                return (False, "Credit Union loans are NOT accepted (All or Nothing rule)", "credit union loan")
+            return (True, f"Consumer Shield CAN enroll {enroll_type} accounts", enroll_type)
+    
+    # Check if question mentions any CANNOT enroll types
+    for cannot_type in cannot_enroll_types:
+        if cannot_type in question_lower:
+            return (False, f"Consumer Shield CANNOT enroll {cannot_type} accounts", cannot_type)
+    
+    # Check for specific creditors that might match account types
+    if creditor_name:
+        creditor_lower = creditor_name.lower()
+        # Furniture stores - check if they provide financing
+        furniture_stores = ["aaron", "nebraska furniture", "rc willey", "bobs furniture", "schewels"]
+        if any(store in creditor_lower for store in furniture_stores):
+            return (False, "Furniture stores that provide their own financing are NOT accepted", "furniture store")
+        
+        # Credit unions
+        if "credit union" in creditor_lower or "cu" in creditor_lower or creditor_lower.endswith("cu"):
+            return (False, "Credit Union loans are NOT accepted (All or Nothing rule applies)", "credit union")
+        
+        # USAA special case
+        if "usaa" in creditor_lower:
+            return (True, "USAA is accepted as long as no other secured debt exists", "usaa")
+    
+    return (None, "Could not determine Consumer Shield eligibility from account type", None)
 
 def ask_gpt_with_system_prompt(system_prompt, user_prompt, max_retries=3):
     """
@@ -703,6 +783,9 @@ def handle_question(question):
     # Step 1: Normalize question
     question_clean = question.lower()
     print(f"🔍 Normalized question: {question_clean}")
+    
+    # Step 1.5: Check if question is about Consumer Shield specifically
+    is_consumer_shield_question = "consumer shield" in question_clean
     
     # Step 2: Comprehensive hardcoded acceptance/rejection logic
     hard_rejections = {
@@ -1136,6 +1219,31 @@ def handle_question(question):
                 else:
                     print(f"❌ Condition not met: {condition} not in question and not 'ca'")
     
+    # Step 2.5: Check Consumer Shield eligibility based on account type
+    consumer_shield_info = None
+    question_lower_for_cs = question_clean
+    # Extract creditor name if mentioned
+    creditor_mentioned = None
+    # Try to find creditor name in question (look for capitalized words that might be creditor names)
+    words = question.split()
+    for i, word in enumerate(words):
+        if len(word) > 3 and word[0].isupper() and word.lower() not in ["Can", "Does", "Is", "Are", "Will", "Would", "Should", "Accept", "Accepted", "Eligible", "Enroll", "Enrollment", "Navy", "Federal", "Credit", "Union"]:
+            # Check if next word is also capitalized (like "Navy Federal")
+            if i + 1 < len(words) and words[i+1][0].isupper():
+                creditor_mentioned = f"{word} {words[i+1]}"
+            else:
+                creditor_mentioned = word
+            break
+    
+    cs_eligible, cs_reason, cs_account_type = check_consumer_shield_eligibility(question_lower_for_cs, creditor_mentioned)
+    if cs_eligible is not None:
+        consumer_shield_info = {
+            "eligible": cs_eligible,
+            "reason": cs_reason,
+            "account_type": cs_account_type
+        }
+        logger.info(f"Consumer Shield check: {cs_eligible} - {cs_reason}")
+    
     # Step 3: Global disqualification check (additional creditors not in hardcoded rules)
     global_disqualified = [
         "accion usa", "diamond resorts", "cashnetusa", "advance financial", "armed forces bank",
@@ -1157,6 +1265,7 @@ def handle_question(question):
             eng = (
                 "❌ *Elevate:* This creditor is disqualified and not eligible under any circumstances.\n"
                 "❌ *Clarity:* This creditor is disqualified based on policy documents.\n"
+                "⚠️ *Consumer Shield:* Check account type eligibility - Consumer Shield uses account type rules, not creditor lists.\n"
                 "📝 *Please advise the client to resolve this debt outside the program.*"
             )
             spa = translate_answer(eng, "spanish")
@@ -1192,6 +1301,7 @@ def handle_question(question):
         eng = (
             "⚠️ *Elevate:* Document search is not available.\n"
             "⚠️ *Clarity:* Document search is not available.\n"
+            "⚠️ *Consumer Shield:* Document search is not available.\n"
             "📝 *Please contact support for assistance.*"
         )
         spa = translate_answer(eng, "spanish")
@@ -1201,6 +1311,7 @@ def handle_question(question):
         eng = (
             "⚠️ *Elevate:* Document search encountered an error.\n"
             "⚠️ *Clarity:* Document search encountered an error.\n"
+            "⚠️ *Consumer Shield:* Document search encountered an error.\n"
             "📝 *Please try rephrasing your question or contact support.*"
         )
         spa = translate_answer(eng, "spanish")
@@ -1212,6 +1323,7 @@ def handle_question(question):
         eng = (
             "⚠️ *Elevate:* No specific information found in policy documents.\n"
             "⚠️ *Clarity:* No specific information found in policy documents.\n"
+            "⚠️ *Consumer Shield:* No specific information found in policy documents.\n"
             "📝 *Please consult the latest program guidelines or contact support for assistance.*"
         )
         spa = translate_answer(eng, "spanish")
@@ -1222,9 +1334,28 @@ def handle_question(question):
     context = "\n\n".join(f"[Source: {src}]\n{chunk}" for chunk, src in context_chunks)
     logger.info(f"Using {len(context_chunks)} chunks for context")
 
-    # Step 5: Create enhanced system prompt with explicit instructions
+    # Step 5: Check Consumer Shield eligibility if question is about a creditor/account type
+    consumer_shield_info = None
+    question_lower_for_cs = question_clean
+    # Extract creditor name if mentioned
+    creditor_mentioned = None
+    for word in question_lower_for_cs.split():
+        if len(word) > 3 and word not in ["can", "does", "is", "are", "will", "would", "should", "accept", "accepted", "eligible", "enroll", "enrollment"]:
+            creditor_mentioned = word
+            break
+    
+    cs_eligible, cs_reason, cs_account_type = check_consumer_shield_eligibility(question_lower_for_cs, creditor_mentioned)
+    if cs_eligible is not None:
+        consumer_shield_info = {
+            "eligible": cs_eligible,
+            "reason": cs_reason,
+            "account_type": cs_account_type
+        }
+        logger.info(f"Consumer Shield check: {cs_eligible} - {cs_reason}")
+    
+    # Step 6: Create enhanced system prompt with explicit instructions
     system_prompt = (
-        "You are an expert in Elevate and Clarity debt relief programs. "
+        "You are an expert in Elevate, Clarity, and Consumer Shield debt relief programs. "
         "Your task is to answer questions based STRICTLY on the provided document chunks.\n\n"
         
         "CRITICAL INSTRUCTIONS:\n"
@@ -1232,19 +1363,28 @@ def handle_question(question):
         "2. Read ALL provided document chunks carefully - information may be in any of them.\n"
         "3. Look for EXACT matches to the question terms, synonyms, and related concepts.\n"
         "4. If information exists in the chunks, you MUST provide it - do not say 'not found' if it's actually there.\n"
-        "5. Always answer for *both* Elevate and Clarity programs, even if the question mentions only one.\n"
+        "5. Always answer for *all three* programs (Elevate, Clarity, and Consumer Shield), even if the question mentions only one.\n"
         "6. Use ✅ for accepted/eligible, ❌ for not accepted/ineligible, ⚠️ for conditional/uncertain.\n"
         "7. Quote specific details from the chunks when possible (e.g., percentages, dollar amounts, conditions).\n\n"
         
+        "CONSUMER SHIELD SPECIAL RULES:\n"
+        "- Consumer Shield does NOT have specific creditor lists - eligibility is based on ACCOUNT TYPE\n"
+        "- Check if the account TYPE matches Consumer Shield's can/cannot enroll lists\n"
+        "- Credit Union loans: NOT accepted (All or Nothing rule)\n"
+        "- Furniture stores with own financing: NOT accepted\n"
+        "- USAA: Accepted only if no other secured debt exists\n"
+        "- See Consumer Shield document for complete account type rules\n\n"
+        
         "ANSWER FORMAT (IN ENGLISH):\n"
-        "- Start with a clear yes/no/conditional answer for each program\n"
+        "- Start with a clear yes/no/conditional answer for EACH program (Elevate, Clarity, Consumer Shield)\n"
         "- Provide specific details from the documents\n"
         "- Include any conditions, limits, or restrictions mentioned\n"
         "- Use emojis for visual clarity (✅ ❌ ⚠️)\n"
-        "- Format: *Elevate:* [answer] and *Clarity:* [answer]\n\n"
+        "- Format: *Elevate:* [answer], *Clarity:* [answer], *Consumer Shield:* [answer]\n\n"
         
         "SPECIAL CASES:\n"
         "- If question mentions a specific creditor, check ALL chunks for that creditor name (including variations)\n"
+        "- For Consumer Shield: Check if the creditor's account TYPE matches the can/cannot enroll lists\n"
         "- If question mentions a state, check for state-specific rules in the chunks\n"
         "- If question asks about debt types (mortgage, auto loan, etc.), search for those exact terms\n"
         "- If information is partially available, provide what you found and note what's missing\n\n"
@@ -1255,6 +1395,10 @@ def handle_question(question):
         
         "REMEMBER: Respond ONLY in English. Do not use Spanish in your response."
     )
+    
+    # Add Consumer Shield info to context if available
+    if consumer_shield_info:
+        context += f"\n\n[Consumer Shield Eligibility Check]:\nAccount Type: {consumer_shield_info['account_type']}\nEligible: {consumer_shield_info['eligible']}\nReason: {consumer_shield_info['reason']}"
     # Ensure question is in English for processing (translate if needed)
     question_lang = detect_language(question)
     if question_lang == "spanish":
